@@ -10,8 +10,10 @@ import {
   clientApiAutoConfirmDisabledClient as signUpDisabledClient,
   clientApiAutoConfirmEnabledClient as signUpEnabledClient,
   authAdminApiAutoConfirmEnabledClient,
+  GOTRUE_URL_SIGNUP_ENABLED_AUTO_CONFIRM_ON,
 } from './lib/clients'
 import { mockUserCredentials } from './lib/utils'
+import { Session } from '../src'
 
 describe('GoTrueClient', () => {
   // @ts-expect-error 'Allow access to private _refreshAccessToken'
@@ -100,15 +102,6 @@ describe('GoTrueClient', () => {
       })
       expect(error).toBeNull()
       expect(data.session).not.toBeNull()
-
-      /**
-       * Sign out the user to verify setSession, getSession and updateUser
-       * are truly working; because the signUp method will already save the session.
-       * And that session will be available to getSession and updateUser,
-       * even if setSession isn't called or fails to save the session.
-       * The tokens are still valid after logout, and therefore usable.
-       */
-      await authWithSession.signOut()
 
       const {
         data: { session },
@@ -363,7 +356,8 @@ describe('GoTrueClient', () => {
       expect(data.session).toBeNull()
       expect(data.user).toBeNull()
 
-      expect(error?.message).toEqual('Error sending confirmation sms: missing Twilio account SID')
+      expect(error?.message).toEqual('Unable to get SMS provider')
+      expect(error?.status).toEqual(500)
     })
 
     test('signUp() with phone', async () => {
@@ -910,6 +904,20 @@ describe('User management', () => {
   })
 })
 
+describe('MFA', () => {
+  test('enroll({factorType: "totp"}) returns totp', async () => {
+    const { data, error } = await authWithSession.mfa.enroll({
+      factorType: 'totp',
+    })
+
+    if (error) {
+      throw error
+    }
+
+    expect(data.totp.qr_code).not.toBeNull()
+  })
+})
+
 describe('GoTrueClient with storageisServer = true', () => {
   const originalWarn = console.warn
   let warnings: any[][] = []
@@ -950,7 +958,7 @@ describe('GoTrueClient with storageisServer = true', () => {
     expect(warnings.length).toEqual(0)
   })
 
-  test('getSession() emits one insecure warning', async () => {
+  test('getSession() emits insecure warning, once per server client, when user object is accessed', async () => {
     const storage = memoryLocalStorageAdapter({
       [STORAGE_KEY]: JSON.stringify({
         access_token: 'jwt.accesstoken.signature',
@@ -969,19 +977,106 @@ describe('GoTrueClient with storageisServer = true', () => {
       storage,
     })
 
-    await client.getUser() // should suppress the first warning
-
     const {
       data: { session },
     } = await client.getSession()
 
-    console.log('User is ', session!.user!.id)
-
+    const user = session?.user // accessing the user object from getSession should emit a warning the first time
+    expect(user).not.toBeNull()
     expect(warnings.length).toEqual(1)
     expect(
       warnings[0][0].startsWith(
         'Using the user object as returned from khulnasoft.auth.getSession() '
       )
     ).toEqual(true)
+
+    const user2 = session?.user // accessing the user object further should not emit a warning
+    expect(user2).not.toBeNull()
+    expect(warnings.length).toEqual(1)
+
+    const {
+      data: { session: session2 },
+    } = await client.getSession() // create new proxy instance
+
+    const user3 = session2?.user // accessing the user object in subsequent proxy instances, for this client, should not emit a warning
+    expect(user3).not.toBeNull()
+    expect(warnings.length).toEqual(1)
+  })
+
+  test('getSession emits no warnings if getUser is called prior', async () => {
+    const client = new GoTrueClient({
+      url: GOTRUE_URL_SIGNUP_ENABLED_AUTO_CONFIRM_ON,
+      autoRefreshToken: false,
+      persistSession: true,
+      storage: {
+        ...memoryLocalStorageAdapter(),
+        isServer: true,
+      },
+    })
+    const { email, password } = mockUserCredentials()
+    await client.signUp({ email, password })
+
+    const {
+      data: { user },
+      error,
+    } = await client.getUser() // should suppress any warnings
+    expect(error).toBeNull()
+    expect(user).not.toBeNull()
+
+    const {
+      data: { session },
+    } = await client.getSession()
+
+    const sessionUser = session?.user // accessing the user object from getSession shouldn't emit a warning
+    expect(sessionUser).not.toBeNull()
+    expect(warnings.length).toEqual(0)
+  })
+
+  test('saveSession should overwrite the existing session', async () => {
+    const store = memoryLocalStorageAdapter()
+    const client = new GoTrueClient({
+      url: GOTRUE_URL_SIGNUP_ENABLED_AUTO_CONFIRM_ON,
+      storageKey: 'test-storage-key',
+      autoRefreshToken: false,
+      persistSession: true,
+      storage: {
+        ...store,
+      },
+    })
+    const initialSession: Session = {
+      access_token: 'test-access-token',
+      refresh_token: 'test-refresh-token',
+      expires_in: 3600,
+      token_type: 'bearer',
+      user: {
+        id: 'test-user-id',
+        aud: 'test-audience',
+        user_metadata: {},
+        app_metadata: {},
+        created_at: new Date().toISOString(),
+      },
+    }
+
+    // @ts-ignore 'Allow access to private _saveSession'
+    await client._saveSession(initialSession)
+    expect(store.getItem('test-storage-key')).toEqual(JSON.stringify(initialSession))
+
+    const newSession: Session = {
+      access_token: 'test-new-access-token',
+      refresh_token: 'test-new-refresh-token',
+      expires_in: 3600,
+      token_type: 'bearer',
+      user: {
+        id: 'test-user-id',
+        aud: 'test-audience',
+        user_metadata: {},
+        app_metadata: {},
+        created_at: new Date().toISOString(),
+      },
+    }
+
+    // @ts-ignore 'Allow access to private _saveSession'
+    await client._saveSession(newSession)
+    expect(store.getItem('test-storage-key')).toEqual(JSON.stringify(newSession))
   })
 })
