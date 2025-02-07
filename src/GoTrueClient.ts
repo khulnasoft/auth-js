@@ -1,5 +1,12 @@
 import GoTrueAdminApi from './GoTrueAdminApi'
-import { DEFAULT_HEADERS, EXPIRY_MARGIN, GOTRUE_URL, STORAGE_KEY } from './lib/constants'
+import {
+  DEFAULT_HEADERS,
+  EXPIRY_MARGIN_MS,
+  AUTO_REFRESH_TICK_DURATION_MS,
+  AUTO_REFRESH_TICK_THRESHOLD,
+  GOTRUE_URL,
+  STORAGE_KEY,
+} from './lib/constants'
 import {
   AuthError,
   AuthImplicitGrantRedirectError,
@@ -11,6 +18,8 @@ import {
   isAuthApiError,
   isAuthError,
   isAuthRetryableFetchError,
+  isAuthSessionMissingError,
+  isAuthImplicitGrantRedirectError,
 } from './lib/errors'
 import {
   Fetch,
@@ -87,6 +96,10 @@ import type {
   LockFunc,
   UserIdentity,
   SignInAnonymouslyCredentials,
+  MFAEnrollTOTPParams,
+  MFAEnrollPhoneParams,
+  AuthMFAEnrollTOTPResponse,
+  AuthMFAEnrollPhoneResponse,
 } from './lib/types'
 
 polyfillGlobalThis() // Make "globalThis" available
@@ -100,14 +113,8 @@ const DEFAULT_OPTIONS: Omit<Required<GoTrueClientOptions>, 'fetch' | 'storage' |
   headers: DEFAULT_HEADERS,
   flowType: 'implicit',
   debug: false,
+  hasCustomAuthorizationHeader: false,
 }
-
-/** Current session will be checked for refresh at this interval. */
-const AUTO_REFRESH_TICK_DURATION = 30 * 1000
-
-/**
- * A token refresh will be attempted this many ticks before the current session expires. */
-const AUTO_REFRESH_TICK_THRESHOLD = 3
 
 async function lockNoOp<R>(name: string, acquireTimeout: number, fn: () => Promise<R>): Promise<R> {
   return await fn()
@@ -154,6 +161,8 @@ export default class GoTrueClient {
   protected headers: {
     [key: string]: string
   }
+  protected hasCustomAuthorizationHeader = false
+  protected suppressGetSessionWarning = false
   protected fetch: Fetch
   protected lock: LockFunc
   protected lockAcquired = false
@@ -202,6 +211,7 @@ export default class GoTrueClient {
     this.lock = settings.lock || lockNoOp
     this.detectSessionInUrl = settings.detectSessionInUrl
     this.flowType = settings.flowType
+    this.hasCustomAuthorizationHeader = settings.hasCustomAuthorizationHeader
 
     if (settings.lock) {
       this.lock = settings.lock
@@ -295,21 +305,34 @@ export default class GoTrueClient {
    */
   private async _initialize(): Promise<InitializeResult> {
     try {
-      const isPKCEFlow = isBrowser() ? await this._isPKCEFlow() : false
-      this._debug('#_initialize()', 'begin', 'is PKCE flow', isPKCEFlow)
+      const params = parseParametersFromURL(window.location.href)
+      let callbackUrlType = 'none'
+      if (this._isImplicitGrantCallback(params)) {
+        callbackUrlType = 'implicit'
+      } else if (await this._isPKCECallback(params)) {
+        callbackUrlType = 'pkce'
+      }
 
-      if (isPKCEFlow || (this.detectSessionInUrl && this._isImplicitGrantFlow())) {
-        const { data, error } = await this._getSessionFromURL(isPKCEFlow)
+      /**
+       * Attempt to get the session from the URL only if these conditions are fulfilled
+       *
+       * Note: If the URL isn't one of the callback url types (implicit or pkce),
+       * then there could be an existing session so we don't want to prematurely remove it
+       */
+      if (isBrowser() && this.detectSessionInUrl && callbackUrlType !== 'none') {
+        const { data, error } = await this._getSessionFromURL(params, callbackUrlType)
         if (error) {
           this._debug('#_initialize()', 'error detecting session from URL', error)
 
-          // hacky workaround to keep the existing session if there's an error returned from identity linking
-          // TODO: once error codes are ready, we should match against it instead of the message
-          if (
-            error?.message === 'Identity is already linked' ||
-            error?.message === 'Identity is already linked to another user'
-          ) {
-            return { error }
+          if (isAuthImplicitGrantRedirectError(error)) {
+            const errorCode = error.details?.code
+            if (
+              errorCode === 'identity_already_exists' ||
+              errorCode === 'identity_not_found' ||
+              errorCode === 'single_identity_not_deletable'
+            ) {
+              return { error }
+            }
           }
 
           // failed login attempt via url,
@@ -365,8 +388,6 @@ export default class GoTrueClient {
    */
   async signInAnonymously(credentials?: SignInAnonymouslyCredentials): Promise<AuthResponse> {
     try {
-      await this._removeSession()
-
       const res = await _request(this.fetch, 'POST', `${this.url}/signup`, {
         headers: this.headers,
         body: {
@@ -410,8 +431,6 @@ export default class GoTrueClient {
    */
   async signUp(credentials: SignUpWithPasswordCredentials): Promise<AuthResponse> {
     try {
-      await this._removeSession()
-
       let res: AuthResponse
       if ('email' in credentials) {
         const { email, password, options } = credentials
@@ -491,8 +510,6 @@ export default class GoTrueClient {
     credentials: SignInWithPasswordCredentials
   ): Promise<AuthTokenResponsePassword> {
     try {
-      await this._removeSession()
-
       let res: AuthResponsePassword
       if ('email' in credentials) {
         const { email, password, options } = credentials
@@ -553,8 +570,6 @@ export default class GoTrueClient {
    * This method supports the PKCE flow.
    */
   async signInWithOAuth(credentials: SignInWithOAuthCredentials): Promise<OAuthResponse> {
-    await this._removeSession()
-
     return await this._handleProviderSignIn(credentials.provider, {
       redirectTo: credentials.options?.redirectTo,
       scopes: credentials.options?.scopes,
@@ -583,33 +598,43 @@ export default class GoTrueClient {
   > {
     const storageItem = await getItemAsync(this.storage, `${this.storageKey}-code-verifier`)
     const [codeVerifier, redirectType] = ((storageItem ?? '') as string).split('/')
-    const { data, error } = await _request(
-      this.fetch,
-      'POST',
-      `${this.url}/token?grant_type=pkce`,
-      {
-        headers: this.headers,
-        body: {
-          auth_code: authCode,
-          code_verifier: codeVerifier,
-        },
-        xform: _sessionResponse,
+
+    try {
+      const { data, error } = await _request(
+        this.fetch,
+        'POST',
+        `${this.url}/token?grant_type=pkce`,
+        {
+          headers: this.headers,
+          body: {
+            auth_code: authCode,
+            code_verifier: codeVerifier,
+          },
+          xform: _sessionResponse,
+        }
+      )
+      await removeItemAsync(this.storage, `${this.storageKey}-code-verifier`)
+      if (error) {
+        throw error
       }
-    )
-    await removeItemAsync(this.storage, `${this.storageKey}-code-verifier`)
-    if (error) {
-      return { data: { user: null, session: null, redirectType: null }, error }
-    } else if (!data || !data.session || !data.user) {
-      return {
-        data: { user: null, session: null, redirectType: null },
-        error: new AuthInvalidTokenResponseError(),
+      if (!data || !data.session || !data.user) {
+        return {
+          data: { user: null, session: null, redirectType: null },
+          error: new AuthInvalidTokenResponseError(),
+        }
       }
+      if (data.session) {
+        await this._saveSession(data.session)
+        await this._notifyAllSubscribers('SIGNED_IN', data.session)
+      }
+      return { data: { ...data, redirectType: redirectType ?? null }, error }
+    } catch (error) {
+      if (isAuthError(error)) {
+        return { data: { user: null, session: null, redirectType: null }, error }
+      }
+
+      throw error
     }
-    if (data.session) {
-      await this._saveSession(data.session)
-      await this._notifyAllSubscribers('SIGNED_IN', data.session)
-    }
-    return { data: { ...data, redirectType: redirectType ?? null }, error }
   }
 
   /**
@@ -617,8 +642,6 @@ export default class GoTrueClient {
    * should be enabled and configured.
    */
   async signInWithIdToken(credentials: SignInWithIdTokenCredentials): Promise<AuthTokenResponse> {
-    await this._removeSession()
-
     try {
       const { options, provider, token, access_token, nonce } = credentials
 
@@ -675,8 +698,6 @@ export default class GoTrueClient {
    */
   async signInWithOtp(credentials: SignInWithPasswordlessCredentials): Promise<AuthOtpResponse> {
     try {
-      await this._removeSession()
-
       if ('email' in credentials) {
         const { email, options } = credentials
         let codeChallenge: string | null = null
@@ -730,13 +751,8 @@ export default class GoTrueClient {
    */
   async verifyOtp(params: VerifyOtpParams): Promise<AuthResponse> {
     try {
-      if (params.type !== 'email_change' && params.type !== 'phone_change') {
-        // we don't want to remove the authenticated session if the user is performing an email_change or phone_change verification
-        await this._removeSession()
-      }
-
-      let redirectTo = undefined
-      let captchaToken = undefined
+      let redirectTo: string | undefined = undefined
+      let captchaToken: string | undefined = undefined
       if ('options' in params) {
         redirectTo = params.options?.redirectTo
         captchaToken = params.options?.captchaToken
@@ -796,7 +812,6 @@ export default class GoTrueClient {
    */
   async signInWithSSO(params: SignInWithSSO): Promise<SSOResponse> {
     try {
-      await this._removeSession()
       let codeChallenge: string | null = null
       let codeChallengeMethod: string | null = null
       if (this.flowType === 'pkce') {
@@ -870,10 +885,6 @@ export default class GoTrueClient {
    */
   async resend(credentials: ResendParams): Promise<AuthOtpResponse> {
     try {
-      if (credentials.type != 'email_change' && credentials.type != 'phone_change') {
-        await this._removeSession()
-      }
-
       const endpoint = `${this.url}/resend`
       if ('email' in credentials) {
         const { email, type, options } = credentials
@@ -1096,8 +1107,13 @@ export default class GoTrueClient {
         return { data: { session: null }, error: null }
       }
 
+      // A session is considered expired before the access token _actually_
+      // expires. When the autoRefreshToken option is off (or when the tab is
+      // in the background), very eager users of getSession() -- like
+      // realtime-js -- might send a valid JWT which will expire by the time it
+      // reaches the server.
       const hasExpired = currentSession.expires_at
-        ? currentSession.expires_at <= Date.now() / 1000
+        ? currentSession.expires_at * 1000 - Date.now() < EXPIRY_MARGIN_MS
         : false
 
       this._debug(
@@ -1109,13 +1125,16 @@ export default class GoTrueClient {
 
       if (!hasExpired) {
         if (this.storage.isServer) {
+          let suppressWarning = this.suppressGetSessionWarning
           const proxySession: Session = new Proxy(currentSession, {
-            get(target: any, prop: string, receiver: any) {
-              if (prop === 'user') {
+            get: (target: any, prop: string, receiver: any) => {
+              if (!suppressWarning && prop === 'user') {
                 // only show warning when the user object is being accessed from the server
                 console.warn(
-                  'Using the user object as returned from khulnasoft.auth.getSession() or from some khulnasoft.auth.onAuthStateChange() events could be insecure! This value comes directly from the storage medium (usually cookies on the server) and many not be authentic. Use khulnasoft.auth.getUser() instead which authenticates the data by contacting the Khulnasoft Auth server.'
+                  'Using the user object as returned from khulnasoft.auth.getSession() or from some khulnasoft.auth.onAuthStateChange() events could be insecure! This value comes directly from the storage medium (usually cookies on the server) and may not be authentic. Use khulnasoft.auth.getUser() instead which authenticates the data by contacting the Khulnasoft Auth server.'
                 )
+                suppressWarning = true // keeps this proxy instance from logging additional warnings
+                this.suppressGetSessionWarning = true // keeps this client's future proxy instances from warning
               }
               return Reflect.get(target, prop, receiver)
             },
@@ -1174,8 +1193,8 @@ export default class GoTrueClient {
           throw error
         }
 
-        if (!data.session?.access_token) {
-          // if there's no access token, the user can't be fetched
+        // returns an error if there is no access_token or custom authorization header
+        if (!data.session?.access_token && !this.hasCustomAuthorizationHeader) {
           return { data: { user: null }, error: new AuthSessionMissingError() }
         }
 
@@ -1187,6 +1206,14 @@ export default class GoTrueClient {
       })
     } catch (error) {
       if (isAuthError(error)) {
+        if (isAuthSessionMissingError(error)) {
+          // JWT contains a `session_id` which does not correspond to an active
+          // session in the database, indicating the user is signed out.
+
+          await this._removeSession()
+          await removeItemAsync(this.storage, `${this.storageKey}-code-verifier`)
+        }
+
         return { data: { user: null }, error }
       }
 
@@ -1401,7 +1428,10 @@ export default class GoTrueClient {
   /**
    * Gets the session data from a URL string
    */
-  private async _getSessionFromURL(isPKCEFlow: boolean): Promise<
+  private async _getSessionFromURL(
+    params: { [parameter: string]: string },
+    callbackUrlType: string
+  ): Promise<
     | {
         data: { session: Session; redirectType: string | null }
         error: null
@@ -1410,15 +1440,39 @@ export default class GoTrueClient {
   > {
     try {
       if (!isBrowser()) throw new AuthImplicitGrantRedirectError('No browser detected.')
-      if (this.flowType === 'implicit' && !this._isImplicitGrantFlow()) {
-        throw new AuthImplicitGrantRedirectError('Not a valid implicit grant flow url.')
-      } else if (this.flowType == 'pkce' && !isPKCEFlow) {
-        throw new AuthPKCEGrantCodeExchangeError('Not a valid PKCE flow url.')
+
+      // If there's an error in the URL, it doesn't matter what flow it is, we just return the error.
+      if (params.error || params.error_description || params.error_code) {
+        // The error class returned implies that the redirect is from an implicit grant flow
+        // but it could also be from a redirect error from a PKCE flow.
+        throw new AuthImplicitGrantRedirectError(
+          params.error_description || 'Error in URL with unspecified error_description',
+          {
+            error: params.error || 'unspecified_error',
+            code: params.error_code || 'unspecified_code',
+          }
+        )
       }
 
-      const params = parseParametersFromURL(window.location.href)
+      // Checks for mismatches between the flowType initialised in the client and the URL parameters
+      switch (callbackUrlType) {
+        case 'implicit':
+          if (this.flowType === 'pkce') {
+            throw new AuthPKCEGrantCodeExchangeError('Not a valid PKCE flow url.')
+          }
+          break
+        case 'pkce':
+          if (this.flowType === 'implicit') {
+            throw new AuthImplicitGrantRedirectError('Not a valid implicit grant flow url.')
+          }
+          break
+        default:
+        // there's no mismatch so we continue
+      }
 
-      if (isPKCEFlow) {
+      // Since this is a redirect for PKCE, we attempt to retrieve the code from the URL for the code exchange
+      if (callbackUrlType === 'pkce') {
+        this._debug('#_initialize()', 'begin', 'is PKCE flow', true)
         if (!params.code) throw new AuthPKCEGrantCodeExchangeError('No code detected.')
         const { data, error } = await this._exchangeCodeForSession(params.code)
         if (error) throw error
@@ -1429,16 +1483,6 @@ export default class GoTrueClient {
         window.history.replaceState(window.history.state, '', url.toString())
 
         return { data: { session: data.session, redirectType: null }, error: null }
-      }
-
-      if (params.error || params.error_description || params.error_code) {
-        throw new AuthImplicitGrantRedirectError(
-          params.error_description || 'Error in URL with unspecified error_description',
-          {
-            error: params.error || 'unspecified_error',
-            code: params.error_code || 'unspecified_code',
-          }
-        )
       }
 
       const {
@@ -1464,7 +1508,7 @@ export default class GoTrueClient {
       }
 
       const actuallyExpiresIn = expiresAt - timeNow
-      if (actuallyExpiresIn * 1000 <= AUTO_REFRESH_TICK_DURATION) {
+      if (actuallyExpiresIn * 1000 <= AUTO_REFRESH_TICK_DURATION_MS) {
         console.warn(
           `@khulnasoft/gotrue-js: Session as retrieved from URL expires in ${actuallyExpiresIn}s, should have been closer to ${expiresIn}s`
         )
@@ -1480,7 +1524,7 @@ export default class GoTrueClient {
         )
       } else if (timeNow - issuedAt < 0) {
         console.warn(
-          '@khulnasoft/gotrue-js: Session as retrieved from URL was issued in the future? Check the device clok for skew',
+          '@khulnasoft/gotrue-js: Session as retrieved from URL was issued in the future? Check the device clock for skew',
           issuedAt,
           expiresAt,
           timeNow
@@ -1518,18 +1562,14 @@ export default class GoTrueClient {
   /**
    * Checks if the current URL contains parameters given by an implicit oauth grant flow (https://www.rfc-editor.org/rfc/rfc6749.html#section-4.2)
    */
-  private _isImplicitGrantFlow(): boolean {
-    const params = parseParametersFromURL(window.location.href)
-
-    return !!(isBrowser() && (params.access_token || params.error_description))
+  private _isImplicitGrantCallback(params: { [parameter: string]: string }): boolean {
+    return Boolean(params.access_token || params.error_description)
   }
 
   /**
    * Checks if the current URL and backing storage contain parameters given by a PKCE flow
    */
-  private async _isPKCEFlow(): Promise<boolean> {
-    const params = parseParametersFromURL(window.location.href)
-
+  private async _isPKCECallback(params: { [parameter: string]: string }): Promise<boolean> {
     const currentStorageContent = await getItemAsync(
       this.storage,
       `${this.storageKey}-code-verifier`
@@ -1568,7 +1608,12 @@ export default class GoTrueClient {
         if (error) {
           // ignore 404s since user might not exist anymore
           // ignore 401s since an invalid or expired JWT should sign out the current session
-          if (!(isAuthApiError(error) && (error.status === 404 || error.status === 401))) {
+          if (
+            !(
+              isAuthApiError(error) &&
+              (error.status === 404 || error.status === 401 || error.status === 403)
+            )
+          ) {
             return { error }
           }
         }
@@ -1576,7 +1621,6 @@ export default class GoTrueClient {
       if (scope !== 'others') {
         await this._removeSession()
         await removeItemAsync(this.storage, `${this.storageKey}-code-verifier`)
-        await this._notifyAllSubscribers('SIGNED_OUT', null)
       }
       return { error: null }
     })
@@ -1811,7 +1855,7 @@ export default class GoTrueClient {
             error &&
             isAuthRetryableFetchError(error) &&
             // retryable only if the request can be sent before the backoff overflows the tick duration
-            Date.now() + nextBackOffInterval - startedAt < AUTO_REFRESH_TICK_DURATION
+            Date.now() + nextBackOffInterval - startedAt < AUTO_REFRESH_TICK_DURATION_MS
           )
         }
       )
@@ -1864,7 +1908,7 @@ export default class GoTrueClient {
   }
 
   /**
-   * Recovers the session from LocalStorage and refreshes
+   * Recovers the session from LocalStorage and refreshes the token
    * Note: this method is async to accommodate for AsyncStorage e.g. in React native.
    */
   private async _recoverAndRefresh() {
@@ -1884,12 +1928,12 @@ export default class GoTrueClient {
         return
       }
 
-      const timeNow = Math.round(Date.now() / 1000)
-      const expiresWithMargin = (currentSession.expires_at ?? Infinity) < timeNow + EXPIRY_MARGIN
+      const expiresWithMargin =
+        (currentSession.expires_at ?? Infinity) * 1000 - Date.now() < EXPIRY_MARGIN_MS
 
       this._debug(
         debugName,
-        `session has${expiresWithMargin ? '' : ' not'} expired with margin of ${EXPIRY_MARGIN}s`
+        `session has${expiresWithMargin ? '' : ' not'} expired with margin of ${EXPIRY_MARGIN_MS}s`
       )
 
       if (expiresWithMargin) {
@@ -1962,7 +2006,6 @@ export default class GoTrueClient {
 
         if (!isAuthRetryableFetchError(error)) {
           await this._removeSession()
-          await this._notifyAllSubscribers('SIGNED_OUT', null)
         }
 
         this.refreshingDeferred?.resolve(result)
@@ -2020,7 +2063,9 @@ export default class GoTrueClient {
    */
   private async _saveSession(session: Session) {
     this._debug('#_saveSession()', session)
-
+    // _saveSession is always called whenever a new session has been acquired
+    // so we can safely suppress the warning returned by future getSession calls
+    this.suppressGetSessionWarning = true
     await setItemAsync(this.storage, this.storageKey, session)
   }
 
@@ -2028,6 +2073,7 @@ export default class GoTrueClient {
     this._debug('#_removeSession()')
 
     await removeItemAsync(this.storage, this.storageKey)
+    await this._notifyAllSubscribers('SIGNED_OUT', null)
   }
 
   /**
@@ -2060,7 +2106,7 @@ export default class GoTrueClient {
 
     this._debug('#_startAutoRefresh()')
 
-    const ticker = setInterval(() => this._autoRefreshTokenTick(), AUTO_REFRESH_TICK_DURATION)
+    const ticker = setInterval(() => this._autoRefreshTokenTick(), AUTO_REFRESH_TICK_DURATION_MS)
     this.autoRefreshTicker = ticker
 
     if (ticker && typeof ticker === 'object' && typeof ticker.unref === 'function') {
@@ -2071,11 +2117,11 @@ export default class GoTrueClient {
       // finished and tests run endlessly. This can be prevented by calling
       // `unref()` on the returned object.
       ticker.unref()
-      // @ts-ignore
+      // @ts-expect-error TS has no context of Deno
     } else if (typeof Deno !== 'undefined' && typeof Deno.unrefTimer === 'function') {
       // similar like for NodeJS, but with the Deno API
       // https://deno.land/api@latest?unstable&s=Deno.unrefTimer
-      // @ts-ignore
+      // @ts-expect-error TS has no context of Deno
       Deno.unrefTimer(ticker)
     }
 
@@ -2167,12 +2213,12 @@ export default class GoTrueClient {
 
               // session will expire in this many ticks (or has already expired if <= 0)
               const expiresInTicks = Math.floor(
-                (session.expires_at * 1000 - now) / AUTO_REFRESH_TICK_DURATION
+                (session.expires_at * 1000 - now) / AUTO_REFRESH_TICK_DURATION_MS
               )
 
               this._debug(
                 '#_autoRefreshTokenTick()',
-                `access token expires in ${expiresInTicks} ticks, a tick lasts ${AUTO_REFRESH_TICK_DURATION}ms, refresh threshold is ${AUTO_REFRESH_TICK_THRESHOLD} ticks`
+                `access token expires in ${expiresInTicks} ticks, a tick lasts ${AUTO_REFRESH_TICK_DURATION_MS}ms, refresh threshold is ${AUTO_REFRESH_TICK_THRESHOLD} ticks`
               )
 
               if (expiresInTicks <= AUTO_REFRESH_TICK_THRESHOLD) {
@@ -2341,6 +2387,8 @@ export default class GoTrueClient {
   /**
    * {@see GoTrueMFAApi#enroll}
    */
+  private async _enroll(params: MFAEnrollTOTPParams): Promise<AuthMFAEnrollTOTPResponse>
+  private async _enroll(params: MFAEnrollPhoneParams): Promise<AuthMFAEnrollPhoneResponse>
   private async _enroll(params: MFAEnrollParams): Promise<AuthMFAEnrollResponse> {
     try {
       return await this._useSession(async (result) => {
@@ -2349,12 +2397,14 @@ export default class GoTrueClient {
           return { data: null, error: sessionError }
         }
 
+        const body = {
+          friendly_name: params.friendlyName,
+          factor_type: params.factorType,
+          ...(params.factorType === 'phone' ? { phone: params.phone } : { issuer: params.issuer }),
+        }
+
         const { data, error } = await _request(this.fetch, 'POST', `${this.url}/factors`, {
-          body: {
-            friendly_name: params.friendlyName,
-            factor_type: params.factorType,
-            issuer: params.issuer,
-          },
+          body,
           headers: this.headers,
           jwt: sessionData?.session?.access_token,
         })
@@ -2363,7 +2413,7 @@ export default class GoTrueClient {
           return { data: null, error }
         }
 
-        if (data?.totp?.qr_code) {
+        if (params.factorType === 'totp' && data?.totp?.qr_code) {
           data.totp.qr_code = `data:image/svg+xml;utf-8,${data.totp.qr_code}`
         }
 
@@ -2437,6 +2487,7 @@ export default class GoTrueClient {
             'POST',
             `${this.url}/factors/${params.factorId}/challenge`,
             {
+              body: { channel: params.channel },
               headers: this.headers,
               jwt: sessionData?.session?.access_token,
             }
@@ -2491,11 +2542,15 @@ export default class GoTrueClient {
     const totp = factors.filter(
       (factor) => factor.factor_type === 'totp' && factor.status === 'verified'
     )
+    const phone = factors.filter(
+      (factor) => factor.factor_type === 'phone' && factor.status === 'verified'
+    )
 
     return {
       data: {
         all: factors,
         totp,
+        phone,
       },
       error: null,
     }
