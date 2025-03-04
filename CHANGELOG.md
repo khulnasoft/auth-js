@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.0 (2025-02-07)
+
+
+### Bug Fixes
+
+* assert type in `decodeJWTPayload` ([#8](https://github.com/khulnasoft/auth-js/issues/8)) ([a5b10d0](https://github.com/khulnasoft/auth-js/commit/a5b10d0152deafe36a30ab2b2b605f2a831214ed))
+
 ## [2.63.1](https://github.com/khulnasoft/auth-js/compare/v2.63.0...v2.63.1) (2024-04-18)
 
 
